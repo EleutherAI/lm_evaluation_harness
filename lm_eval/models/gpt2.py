@@ -4,10 +4,13 @@ import torch.nn.functional as F
 from lm_eval.base import LM
 from lm_eval import utils
 from tqdm import tqdm
+import numpy as np
 
 
 class GPT2LM(LM):
     MAX_GEN_TOKS = 256
+    VOCAB_SIZE = 50257
+    EOT_TOKEN_ID = 50256
 
     def __init__(self, device=None, pretrained='gpt2'):
         super().__init__()
@@ -39,7 +42,7 @@ class GPT2LM(LM):
         for context, continuation in requests:
             if context == "":
                 # end of text as context
-                context_enc = [50256]
+                context_enc = [self.EOT_TOKEN_ID]
             else:
                 context_enc = self.tokenizer.encode(context)
 
@@ -49,7 +52,36 @@ class GPT2LM(LM):
 
         return self._loglikelihood_tokens(new_reqs)
 
-    def _loglikelihood_tokens(self, requests):
+    def loglikelihood_perplexity(self, requests):
+        # TODO: Implement caching once we've confirmed the perplexity implementation
+        # TODO: automatic batch size detection for vectorization
+
+        loglikelihoods = []
+        with torch.no_grad():
+            for string, in tqdm(requests):
+                encoded = self.tokenizer.encode_plus(string)["input_ids"]
+
+                rolling_token_windows = list(map(utils.make_disjoint_window, utils.get_rolling_token_windows(
+                    token_list=encoded,
+                    prefix_token=self.EOT_TOKEN_ID,
+                    max_seq_len=self.max_length,
+                    context_len=1,
+                )))
+
+                rolling_token_windows = [(None,) + x for x in rolling_token_windows]
+
+                # TODO: extract out this call so it only gets called once and also somehow figure out partial caching for that
+                string_nll = self._loglikelihood_tokens(rolling_token_windows, disable_tqdm=True)
+                
+                # discard is_greedy
+                string_nll = [x[0] for x in string_nll]
+                
+                string_nll = sum(string_nll)
+                loglikelihoods.append(string_nll)
+
+        return loglikelihoods
+
+    def _loglikelihood_tokens(self, requests, disable_tqdm=False):
         # TODO: implement some kind of efficient-request-middleware that lumps together requests with the same context
         res = []
         with torch.no_grad():
@@ -59,15 +91,28 @@ class GPT2LM(LM):
             def _collate(x):
                 toks = x[1] + x[2]
                 return (len(toks), tuple(toks))
-            
-            reord = utils.Reorderer(requests, _collate)
-            for cache_key, context_enc, continuation_enc in tqdm(reord.get_reordered()):
-                # when too long to fit in context, truncate from the left
-                inp = torch.tensor([(context_enc + continuation_enc)[-self.max_length:]], dtype=torch.long).to(self.device)
-                ctxlen = len(context_enc) - max(0, len(context_enc) + len(continuation_enc) - self.max_length)
 
-                cont_toks = inp[:, ctxlen:]  # [batch, seq]
-                logits = F.log_softmax(self.gpt2(inp)[0][:, :, :50257], dim=-1)[:, ctxlen - 1:-1]  # [batch, seq, vocab]
+            reord = utils.Reorderer(requests, _collate)
+            for cache_key, context_enc, continuation_enc in tqdm(reord.get_reordered(), disable=disable_tqdm):
+                assert len(context_enc) > 0
+                assert len(continuation_enc) > 0
+                assert len(continuation_enc) <= self.max_length
+                
+                # how this all works:
+                #          CTX      CONT
+                # inp    0 1 2 3|4 5 6 7 8 9 <- last token is deleted by inp[:, :-1]
+                # gpt2    \               \
+                # logits   1 2 3|4 5 6 7 8 9   <- the ctx half gets tossed out by the [:, -len(continuation_enc):, :self.VOCAB_SIZE] slice
+                # cont_toks      4 5 6 7 8 9
+
+                # when too long to fit in context, truncate from the left
+                inp = torch.tensor([
+                    (context_enc + continuation_enc)[-(self.max_length+1):] 
+                ], dtype=torch.long).to(self.device)
+
+                cont_toks = inp[:, -len(continuation_enc):]  # [batch, seq]
+
+                logits = F.log_softmax(self.gpt2(inp[:, :-1])[0][:, -len(continuation_enc):, :self.VOCAB_SIZE], dim=-1)  # [batch, seq, vocab] - vocab size is clipped to exclude padding tokens or whatever
 
                 greedy_tokens = logits.argmax(dim=-1)
                 max_equal = (greedy_tokens == cont_toks).all()
@@ -76,7 +121,7 @@ class GPT2LM(LM):
 
                 logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1) # [batch, seq]
 
-                answer = (float(logits.sum()), bool(max_equal))
+                answer = (float(logits.cpu().to(torch.float64).sum()), bool(max_equal))
 
                 # partial caching
                 if cache_key is not None:
